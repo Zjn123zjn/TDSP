@@ -25,7 +25,7 @@ from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, 
 
 from triton_kernels.flash_attn import attention
 from triton_kernels.flash_attn_mse_loss import attention_mse_loss
-from prefill_prune import segmented_prefill_attention
+from prefill import hybrid_prefill_attention
 import os, csv, hashlib
 # torch.backends.cuda.enable_flash_sdp(enabled=True)
 # torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
@@ -86,11 +86,14 @@ class LlamaAttentionExperimental(nn.Module):
         self.late_context_upweight = False
         self.softmax_causal_loss_mse = False
         self.softmax_causal_loss_ce = False
+        # The final prompt query is also the first autoregressive decode query;
+        # emphasize it so one predictor learns both prefill and decode priors.
+        self.decode_prior_weight = 2.0
         self.old_predictor = None
         self.pairwise_loss = False
         self.mode = "balanced"  # "extreme_recall" or "balanced"
         self.pairwise_topk_ratio = 0.02  # fraction of keys used as pos/neg in pairwise loss
-        self.predictor_variant = "attentive_project"
+        self.tokenbutler_variant = "tokenbutler_project"
 
         # Whether this layer runs the predictor (i.e. is the group root that
         # produces queries for producer_frequency future layers).
@@ -103,9 +106,9 @@ class LlamaAttentionExperimental(nn.Module):
         # Decode‑time gating: prefill + first generated token stay dense.
         self._dense_kv_cutoff = 0
         self.always_dense_decode_tokens = 1
-        # Prefill pruning knobs. These are inference-only and leave
+        # Hybrid prefill pruning knobs. These are inference-only and leave
         # predictor training on dense attention.
-        self.prefill_prune_enabled = False
+        self.hybrid_prefill_enabled = False
         self.prefill_segment_size = 512
         self.prefill_threshold_len = 4096
         self.prefill_block_size = 32
@@ -200,7 +203,7 @@ class LlamaAttentionExperimental(nn.Module):
             intdim=self.intdim,
             attn_reduce_factor=self.attn_reduce_factor,
             dropout=0.1,
-            predictor_variant=getattr(self, "predictor_variant", "attentive_project"),
+            predictor_variant=getattr(self, "tokenbutler_variant", "tokenbutler_project"),
         ).to(attn_device)
         self.sparse_token_predictor.flash_attn = self.flash_attn
 
@@ -332,7 +335,7 @@ class LlamaAttentionExperimental(nn.Module):
 
         Returns:
             mask_tensor: [B, H, 1, K] with values in {0, -inf}, where -inf marks
-            tokens pruned by decode sparsity (excluding sink + sliding-window tokens).
+            tokens pruned by TokenButler (excluding sink + sliding‑window tokens).
         """
         bsz, num_heads, q_len, key_len = importance_scores.shape
         assert q_len == 1, "Decode‑time mask only makes sense for q_len == 1"
@@ -344,7 +347,7 @@ class LlamaAttentionExperimental(nn.Module):
         #   - not in the sink region [0:min_sparse_index)
         #   - not in the sliding‑window tail (always‑keep region)
         attn_valid = (attention_mask[:, :, -1:, :] == 0)  # [B,1,1,K]
-        candidate_mask = attn_valid.expand(bsz, num_heads, 1, key_len)
+        candidate_mask = attn_valid.expand(bsz, num_heads, 1, key_len).clone()
 
         if min_sparse_index is not None and min_sparse_index > 0:
             clamp_idx = min(min_sparse_index, key_len)
@@ -542,7 +545,7 @@ class LlamaAttentionExperimental(nn.Module):
         # Track where we are in the sequence for decode‑time sparsity.
         # Heuristic: a call with q_len > 1 and kv_seq_len == q_len is a full prefill
         # for a fresh sequence.  We then keep this prefill *and* the first decode
-        # token dense, and only apply decode sparsity afterwards.
+        # token dense, and only apply TokenButler pruning afterwards.
         if self.inference_mode and use_cache and q_len > 1 and kv_seq_len == q_len:
             # New sequence prefill: remember the length and give the next
             # 'always_dense_decode_tokens' decode steps dense attention.
@@ -571,11 +574,11 @@ class LlamaAttentionExperimental(nn.Module):
             with torch.no_grad():
                 if evalmode == "ExpPred":
                     if (
-                        self.prefill_prune_enabled
+                        self.hybrid_prefill_enabled
                         and q_len > 1
                         and self.layer_idx + 1 > self.prefill_layer_skip
                     ):
-                        attn_output = segmented_prefill_attention(
+                        attn_output = hybrid_prefill_attention(
                             self,
                             past_key_value,
                             query_states,
@@ -710,7 +713,7 @@ class LlamaAttentionExperimental(nn.Module):
                             )
 
                             if not apply_sparse:
-                                # Either prefill or first decode step → no decode sparsity.
+                                # Either prefill or first decode step → no TokenButler pruning.
                                 mask_tensor = torch.zeros_like(importance_scores)
                             else:
                                 if q_len != 1:
@@ -725,7 +728,7 @@ class LlamaAttentionExperimental(nn.Module):
                         final_mask = mask_tensor
                         self.final_mask_investigate = final_mask
                     elif not (
-                        self.prefill_prune_enabled
+                        self.hybrid_prefill_enabled
                         and q_len > 1
                         and self.layer_idx + 1 > self.prefill_layer_skip
                     ):
@@ -736,7 +739,7 @@ class LlamaAttentionExperimental(nn.Module):
 
             # Build the final additive mask actually used for attention:
             # causal/padding from `attention_mask` plus (for decode steps)
-            # the predictor‑based sparsity mask. We only apply decode sparsity
+            # the predictor‑based sparsity mask. We only apply TokenButler
             # sparsity on single‑token decode steps (q_len == 1), matching
             # the old behaviour.
             if attention_mask is not None:
@@ -753,13 +756,58 @@ class LlamaAttentionExperimental(nn.Module):
             # full [B, H, Lq, Lk] matrix for the V‑product.
             
             if not (
-                self.prefill_prune_enabled
+                self.hybrid_prefill_enabled
                 and q_len > 1
                 and self.layer_idx + 1 > self.prefill_layer_skip
             ):
                 if full_mask is not None:
                     full_mask = full_mask.to(dtype=query_states.dtype)
-                if full_mask is not None:
+                compact_decode = (
+                    q_len == 1
+                    and final_mask is not None
+                    and full_mask is not None
+                )
+                if compact_decode:
+                    keep_mask = full_mask[:, :, -1, :] == 0
+                    max_keep = int(keep_mask.sum(dim=-1).max().item())
+                    if max_keep > 0 and max_keep < key_states.size(2):
+                        # Gather selected KV into a shorter sequence so the
+                        # decode kernel skips pruned cache entries in practice.
+                        selected_idx = keep_mask.to(torch.int32).topk(
+                            max_keep, dim=-1
+                        ).indices
+                        selected_valid = keep_mask.gather(-1, selected_idx)
+                        gather_idx = selected_idx.unsqueeze(-1).expand(
+                            -1, -1, -1, self.head_dim
+                        )
+                        compact_keys = key_states.gather(2, gather_idx)
+                        compact_values = value_states.gather(2, gather_idx)
+                        compact_mask = torch.zeros(
+                            selected_valid.size(0),
+                            selected_valid.size(1),
+                            1,
+                            selected_valid.size(2),
+                            device=query_states.device,
+                            dtype=query_states.dtype,
+                        ).masked_fill(
+                            ~selected_valid.unsqueeze(2), float("-inf")
+                        )
+                        attn_output = torch.nn.functional.scaled_dot_product_attention(
+                            query_states,
+                            compact_keys,
+                            compact_values,
+                            attn_mask=compact_mask,
+                            is_causal=False,
+                        )
+                    else:
+                        attn_output = torch.nn.functional.scaled_dot_product_attention(
+                            query_states,
+                            key_states,
+                            value_states,
+                            attn_mask=full_mask,
+                            is_causal=False,
+                        )
+                elif full_mask is not None:
                     attn_output = torch.nn.functional.scaled_dot_product_attention(
                         query_states,
                         key_states,
@@ -792,7 +840,7 @@ class LlamaAttentionExperimental(nn.Module):
 
         else:
             if self.flash_attn:
-                raise NotImplementedError("Flash attention with decode sparsity is not implemented yet.")
+                raise NotImplementedError("Flash attention with TokenButler is not implemented yet.")
             else:
                 # --- Main model attention path: use scaled_dot_product_attention to avoid L^2 materialization ---
                 # query_states/key_states/value_states: [B, H, Lq/Lk, D]
@@ -959,7 +1007,14 @@ class LlamaAttentionExperimental(nn.Module):
                         target_dist = F.softmax(teacher_logits, dim=-1).detach()
                         pred_dist   = F.softmax(student_logits, dim=-1)
                         ce = -(target_dist * (pred_dist + 1e-9).log()).sum(dim=-1)  # [B,H,R]
-                        self.msemagn_loss = 0.1 * ce.mean()
+                        row_weights = torch.ones(
+                            loss_row_idx.numel(), device=ce.device, dtype=ce.dtype
+                        )
+                        decode_rows = loss_row_idx == (effective_q_len - 1)
+                        row_weights[decode_rows] = getattr(self, "decode_prior_weight", 2.0)
+                        self.msemagn_loss = 0.1 * (
+                            ce * row_weights.view(1, 1, -1)
+                        ).sum() / (row_weights.sum() * bsz * self.num_heads)
     
                     elif getattr(self, "pairwise_loss", False):
                         # Pairwise logistic ranking on [B,H,R,Lk]
