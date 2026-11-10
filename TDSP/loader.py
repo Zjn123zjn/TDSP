@@ -92,6 +92,7 @@ def load_hybrid_model(
         module.late_context_upweight = False
         module.softmax_causal_loss_mse = False
         module.softmax_causal_loss_ce = True
+        module.decode_prior_weight = 2.0
         module.pairwise_loss = False
         module.pairwise_ce_loss = False
         module.min_sparse_index = min_sparse_index
@@ -99,7 +100,7 @@ def load_hybrid_model(
         module.num_layers_pred = module.producer_frequency
         module.sliding_window = sliding_window
         module.max_loss_rows = 256
-        module.predictor_variant = "attentive_project"
+        module.tokenbutler_variant = "tokenbutler_project"
         module.token_sparse_method = token_sparse_method
         if token_sparse_method:
             module.set_token_sparsity()
@@ -150,7 +151,7 @@ def set_token_sparsity(model, token_sparse_method: Optional[str]) -> None:
             module.effective_sparsity = 0.0
 
 
-def set_prefill_prune(
+def set_hybrid_prefill(
     model,
     enabled: bool,
     segment_size: int = 512,
@@ -161,7 +162,7 @@ def set_prefill_prune(
     layer_skip: int = 1,
 ) -> None:
     for module in _attention_modules(model):
-        module.prefill_prune_enabled = enabled
+        module.hybrid_prefill_enabled = enabled
         module.prefill_segment_size = segment_size
         module.prefill_threshold_len = threshold_len
         module.prefill_block_size = block_size
