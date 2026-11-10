@@ -51,49 +51,60 @@ def _cache_profiling(
 
     query_states = query_states[:, :, :pool_len, :]
     key_states = key_states[:, :, :pool_len, :]
-
-    query_states = query_states.reshape(
-        bsz, num_heads, pool_len // segment_size, segment_size, head_dim
-    )
-
     key_states = repeat_kv(key_states, num_key_value_groups)
-    key_states = key_states.reshape(
-        bsz, num_heads, pool_len // block_size, block_size, head_dim
+
+    # Use the same predictor that supplies decode-time token scores. Pooling its
+    # low-dimensional Q/K features keeps prefill selection segment- and block-wise.
+    producer = attn_module.producer
+    if producer is None or producer.q_importance is None:
+        raise RuntimeError("The shared TokenButler predictor has no prefill Q scores")
+    slot_idx = attn_module._get_group_slot_index()
+    q_features = producer.q_importance[:, slot_idx].view(
+        bsz, num_heads, seqlen, attn_module.dDash
+    )[:, :, :pool_len].float()
+    key_proj = producer.sparse_token_predictor.key_cache_proj[
+        attn_module.layer_idx
+    ]
+    key_features = key_states.to(key_proj.device, dtype=key_proj.dtype)
+    key_features = torch.einsum("bhlk,hkd->bhld", key_features, key_proj)
+    key_features = key_features.to(query_states.device, dtype=torch.float32)
+    q_features = q_features.reshape(
+        bsz, num_heads, pool_len // segment_size, segment_size, attn_module.dDash
+    )
+    key_features = key_features.reshape(
+        bsz, num_heads, pool_len // block_size, block_size, attn_module.dDash
     )
 
-    layer_max_q = query_states.max(dim=-2).values
-    layer_max_k = key_states.max(dim=-2).values
-    layer_min_q = query_states.min(dim=-2).values
-    layer_min_k = key_states.min(dim=-2).values
+    layer_max_q = q_features.max(dim=-2).values
+    layer_max_k = key_features.max(dim=-2).values
+    layer_min_q = q_features.min(dim=-2).values
+    layer_min_k = key_features.min(dim=-2).values
 
     q_block_len = layer_max_q.size(-2)
     k_block_len = layer_max_k.size(-2)
-    qq = torch.cat([layer_max_q, layer_min_q], dim=-2)
-    attn_weights_max = (
-        torch.matmul(qq, layer_max_k.transpose(2, 3))
-        .view(bsz, num_heads, 2, q_block_len, k_block_len)
-        .mean(dim=2)
-    )
-    attn_weights_min = (
-        torch.matmul(qq, layer_min_k.transpose(2, 3))
-        .view(bsz, num_heads, 2, q_block_len, k_block_len)
-        .mean(dim=2)
-    )
-    attn_weights = torch.max(attn_weights_max, attn_weights_min)
+    scale = math.sqrt(attn_module.dDash)
+    qmax_kmax = torch.matmul(layer_max_q, layer_max_k.transpose(2, 3))
+    qmin_kmin = torch.matmul(layer_min_q, layer_min_k.transpose(2, 3))
+    qmax_kmin = torch.matmul(layer_max_q, layer_min_k.transpose(2, 3))
+    qmin_kmax = torch.matmul(layer_min_q, layer_max_k.transpose(2, 3))
+    attn_weights = torch.maximum(
+        torch.maximum(qmax_kmax, qmin_kmin),
+        torch.maximum(qmax_kmin, qmin_kmax),
+    ) / scale
 
     attn_weights = attn_weights.view(
         bsz, num_heads_k, num_key_value_groups, num_segments, num_blocks
     ).mean(dim=2)
 
-    mask = torch.full(
-        (num_blocks, num_blocks),
+    block_ids = torch.arange(num_blocks, device=attn_weights.device)
+    segment_ids = torch.arange(num_segments, device=attn_weights.device)
+    # Current-segment KV is retained as the local window. Rank only complete,
+    # strictly preceding blocks so the selector cannot see future cache entries.
+    visible_blocks = (segment_ids * nrep).clamp_min(1)[:, None]
+    attn_weights = attn_weights.masked_fill(
+        block_ids[None, :] >= visible_blocks,
         torch.finfo(attn_weights.dtype).min,
-        device=attn_weights.device,
     )
-    mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-    mask.masked_fill_(mask_cond + nrep < (mask_cond + 1).view(mask.size(-1), 1), 0)
-    mask = mask.view(num_segments, nrep, num_blocks)[:, -1, :]
-    attn_weights = attn_weights + mask[None, None, :, :]
 
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
@@ -102,7 +113,7 @@ def _cache_profiling(
         if prev is None or attn_module.layer_idx <= 1:
             cache_state.prefill_prev_attn_weights = attn_weights
         else:
-            blended = prev.to(attn_weights.device) * 0.25 + attn_weights * 0.75
+            blended = prev.to(attn_weights.device) * 0.75 + attn_weights * 0.25
             cache_state.prefill_prev_attn_weights = blended
             attn_weights = blended
 
@@ -148,7 +159,7 @@ def _cache_selection(
     return selected_k, selected_v
 
 
-def segmented_prefill_attention(
+def hybrid_prefill_attention(
     attn_module,
     cache_state,
     query_states: torch.Tensor,
@@ -156,7 +167,7 @@ def segmented_prefill_attention(
     value_states: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Segmented block-based prefill attention using PyTorch SDPA.
+    CritiPrefill-style segmented prefill attention using PyTorch SDPA.
 
     Args:
         query_states/key_states/value_states: [B, H, L, D]
@@ -171,6 +182,21 @@ def segmented_prefill_attention(
     budget = attn_module.prefill_budget
 
     if input_len <= 1 or input_len < segment_size or input_len < threshold_len:
+        return F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=True,
+        )
+
+    # Predictor owners produce Q features only after their own attention call.
+    # Keep that layer dense if a caller sets layer_skip=0; later layers still
+    # use the shared predictor without creating a cyclic dependency.
+    if getattr(attn_module, "producer", None) is None or getattr(
+        attn_module.producer, "q_importance", None
+    ) is None:
         return F.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -212,12 +238,14 @@ def segmented_prefill_attention(
         ):
             curr_segment = i // segment_size
             if curr_segment < block_index.size(2):
-                index = block_index[:, :, curr_segment, :]
                 available_blocks = (k_segment.size(2) - segment_size) // block_size
                 if available_blocks > 0:
-                    # Profiling runs over the full prefill window, but each segment can
-                    # only gather from blocks that are already visible causally.
-                    index = index.clamp_max(available_blocks - 1)
+                    index = block_index[:, :, curr_segment, :]
+                    # Top-k is ranked with causal-invalid blocks at -inf, so
+                    # the first entries are valid. Limit the budget to blocks
+                    # visible before this segment. Keep KV-head indexing here;
+                    # SDPA performs the GQA expansion for the attention call.
+                    index = index[:, :, : min(index.size(-1), available_blocks)]
                     k_segment, v_segment = _cache_selection(
                         k_segment,
                         v_segment,
